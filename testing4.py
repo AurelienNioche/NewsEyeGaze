@@ -2,6 +2,7 @@ import torch
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
+import pandas as pd
 
 
 class Model(torch.nn.Module):
@@ -33,7 +34,7 @@ class Model(torch.nn.Module):
         else:
             return k, lbd
 
-    def forward(self, y, n_sample=100):
+    def forward(self, i, d, y, n_sample=100):
 
         k, lbd, penalty = self.draw_samples(compute_penalty=True, n_sample=n_sample)
 
@@ -45,28 +46,34 @@ class Model(torch.nn.Module):
 
 class Dataset(torch.utils.data.Dataset):
 
-    def __init__(self):
-        self.y = self.generate_data()
+    def __init__(self, condition):
+        self.i, self.d, self.y = self.load_data(condition)
 
-    @staticmethod
-    def generate_data():
-        n = 4000
-        k = 0.90
-        lbda = 1.04
-        y = torch.distributions.Weibull(concentration=k, scale=lbda).sample((n,))
-        return y
+    def load_data(self, condition):
+        df = pd.read_csv("data/stan_data_covariates.csv", index_col=0)
+        df = df[df.x == condition]
+        i = torch.tensor(df.i.values, dtype=torch.float)
+        d = torch.tensor(df.d.values, dtype=torch.float)
+        y = torch.tensor(df.y.values, dtype=torch.float)
+
+        # y = torch.distributions.Weibull()
+
+        return i, d, y
 
     def __len__(self):
         return len(self.y)
 
     def __getitem__(self, idx):
-        return self.y[idx]
+        return self.i[idx], self.d[idx], self.y[idx]
 
 
 def main():
+
+    condition = 1
+
     torch.manual_seed(123)
 
-    data = Dataset()
+    data = Dataset(condition=condition)
 
     n_obs = len(data)
     print("n observation", n_obs)
@@ -82,8 +89,8 @@ def main():
     hist_loss = []
 
     for _ in tqdm(range(n_epochs)):
-        for batch, y in enumerate(dataloader):
-            loss = model(y, n_sample=n_sample)
+        for batch, (i, d, y) in enumerate(dataloader):
+            loss = model(i=i, d=d, y=y, n_sample=n_sample)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
