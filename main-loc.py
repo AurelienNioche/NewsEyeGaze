@@ -13,7 +13,7 @@ class Dataset(torch.utils.data.Dataset):
         self.x_loc, self.y_loc, self.y = self.load_data(condition)
 
     def load_data(self, condition):
-        df = pd.read_csv("data/stan_data_locmodel.csv", index_col=0)
+        df = pd.read_csv("data/stan_data_locmodel-exact.csv", index_col=0)
         df = df[df.x == condition]
         x_loc = torch.tensor(df.xloc.values, dtype=torch.float)
         y_loc = torch.tensor(df.yloc.values, dtype=torch.float)
@@ -112,7 +112,7 @@ def main():
     fig_folder = "fig/main-loc"
     os.makedirs(fig_folder, exist_ok=True)
 
-    condition = 1
+    condition = 2
 
     torch.manual_seed(123)
 
