@@ -19,7 +19,7 @@ class Dataset(torch.utils.data.Dataset):
         self.n_covar = len(self.covar)
 
     def load_data(self, condition):
-        df = pd.read_csv("data/n_visits.csv", index_col=0)
+        df = pd.read_csv("data/stan_data_all.csv", index_col=0)
         df = df[df.x == condition]
         x_loc = torch.tensor(df.xloc.values, dtype=torch.float)
         y_loc = torch.tensor(df.yloc.values, dtype=torch.float)
@@ -27,8 +27,7 @@ class Dataset(torch.utils.data.Dataset):
         y_loc -= 0.5
         i = torch.tensor(df.i.values, dtype=torch.float)
         d = torch.tensor(df.d.values, dtype=torch.float)
-
-        y = torch.tensor(df.n_visits.values, dtype=torch.float)
+        y = torch.tensor(df.y.values, dtype=torch.float)
         return x_loc, y_loc, i, d, y
 
     def __len__(self):
@@ -46,14 +45,16 @@ class Model(torch.nn.Module):
         super().__init__()
         self.n_covar = n_covar
 
-        self.logvar = torch.nn.Parameter(torch.zeros(n_covar+1))
-        self.mu = torch.nn.Parameter(torch.zeros(n_covar+1))
+        self.logvar = torch.nn.Parameter(torch.zeros(n_covar + 1))
+        self.mu = torch.nn.Parameter(torch.zeros(n_covar + 1))
+
+        self.alpha_param = torch.nn.Parameter(torch.zeros(2))
 
     def beta_dist_parameters(self):
 
         param = []
 
-        for i in range(self.n_covar+1):
+        for i in range(self.n_covar + 1):
             logvar = self.logvar[i]
             mu = self.mu[i]
             sd = (0.5 * logvar).exp()
@@ -61,14 +62,21 @@ class Model(torch.nn.Module):
 
         return param
 
-    def forward(self, covar, y, n_sample):
+    def forward(self, covar, y, n_sample,
+                lbd_scale, k_scale):  # !!! Be aware of this arbitrary choice
 
-        penalty = torch.zeros((n_sample, 1))
+        alpha_mu, alpha_logvar = self.alpha_param
+        alpha_sd = (0.5 * alpha_logvar).exp()
+        alpha_smp = torch.randn(size=(n_sample, 1)) * alpha_sd + alpha_mu
+        unc_k = alpha_smp
 
-        random_n = torch.randn(size=(self.n_covar+1, n_sample, 1))
+        penalty = torch.distributions.Normal(alpha_mu, alpha_sd).log_prob(alpha_smp)
+        prior = torch.zeros((n_sample, 1))
+
+        random_n = torch.randn(size=(self.n_covar + 1, n_sample, 1))
 
         sum_beta = torch.zeros((n_sample, len(y)))
-        for i in range(self.n_covar+1):
+        for i in range(self.n_covar + 1):
             logvar = self.logvar[i]
             mu = self.mu[i]
             rd = random_n[i]
@@ -77,25 +85,31 @@ class Model(torch.nn.Module):
             if i == self.n_covar:
                 sum_beta += beta_smp
             else:
-                sum_beta += beta_smp*covar[i]
+                sum_beta += beta_smp * covar[i]
 
             penalty += torch.distributions.Normal(mu, sd).log_prob(beta_smp)
+            prior += torch.distributions.Normal(0, 10).log_prob(beta_smp)
 
-        rate = 1e-7 + sum_beta.exp()
+        k_smp = 1e-7 + torch.exp(unc_k) # * k_scale        # alpha in Stan, k/shape in Wikipedia, k/contentration in Torch
+        lbd_smp = 1e-7 + torch.exp(-sum_beta / k_smp) # * lbd_scale  # sigma in Stan, lambda/scale in Wikipdedia, scale in Torch
 
-        lls = torch.distributions.Poisson(rate).log_prob(y).sum(axis=-1)
+        prior += torch.distributions.Normal(0, 10).log_prob(k_smp)
+
+        lls = torch.distributions.Weibull(k_smp, lbd_smp).log_prob(y).sum(axis=-1)
         lls_mean = lls.mean()
-        to_min = - lls_mean + penalty.mean()
+        to_min = - lls_mean + penalty.mean() - prior.mean()
         return to_min
 
 
 def run(condition):
 
-    n_epochs = 300
-    n_sample = 40
-    learning_rate = 0.05
-    seed = 1234
-    fig_folder = f"fig/main-n-visit/condition{condition}"
+    n_epochs = 600
+    n_sample = 10
+    lbd_scale = 2
+    k_scale = 2
+    learning_rate = 0.001
+    seed = 12345
+    fig_folder = "fig/main-all"
 
     os.makedirs(fig_folder, exist_ok=True)
 
@@ -116,7 +130,8 @@ def run(condition):
 
     for _ in tqdm(range(n_epochs)):
         for batch, (covar, y) in enumerate(dataloader):
-            loss = model(covar=covar, y=y, n_sample=n_sample)
+            loss = model(covar=covar, y=y, n_sample=n_sample,
+                         lbd_scale=lbd_scale, k_scale=k_scale)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -162,7 +177,12 @@ def run(condition):
             fig, ax = plt.subplots()
 
             lower, upper = mu-1.96*sd, mu+1.96*sd
-            print(f"{key}={mu:.3f} [{lower:.3f}, {upper:.3f}]")
+
+            if (lower < 0 and upper < 0) or (upper > 0 and lower > 0):
+                sign = "*"
+            else:
+                sign = ""
+            print(f"{key}={mu:.3f} [{lower:.3f}, {upper:.3f}]{sign}")
 
             x = torch.linspace(mu-3*sd, mu+3*sd, 100)
             y = torch.distributions.Normal(mu, sd).log_prob(x).exp()

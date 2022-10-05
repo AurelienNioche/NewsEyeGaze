@@ -5,6 +5,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
+import numpy as np
 
 
 class Dataset(torch.utils.data.Dataset):
@@ -12,37 +13,41 @@ class Dataset(torch.utils.data.Dataset):
     def __init__(self, condition):
         self.condition = condition
 
-        self.x_loc, self.y_loc, self.i, self.d, self.y = self.load_data(condition)
-        self.covar = "x_loc", "y_loc", "i", "d"
-        if condition == 1:
-            self.covar = self.covar[1:]
+        self.covar = ["i", "d"]
+        if condition == 1 and "xloc" in self.covar:
+            self.covar.remove("xloc")
+
         self.n_covar = len(self.covar)
+
+        self.data = self.load_data(condition)
+        self.n_observation = len(self.data["y"])
 
     def load_data(self, condition):
         df = pd.read_csv("data/stan_data_all.csv", index_col=0)
         df = df[df.x == condition]
-        x_loc = torch.tensor(df.xloc.values, dtype=torch.float)
-        y_loc = torch.tensor(df.yloc.values, dtype=torch.float)
-        x_loc -= 0.5
-        y_loc -= 0.5
-        i = torch.tensor(df.i.values, dtype=torch.float)
-        d = torch.tensor(df.d.values, dtype=torch.float)
 
-        y = torch.tensor(df.y.values, dtype=torch.float)
-        return x_loc, y_loc, i, d, y
+        data = {}
+        for covar in self.covar:
+            values = torch.tensor(df[covar].values, dtype=torch.float)
+            if covar in ("xloc", "yloc"):
+                values -= 0.5
+            data[covar] = values
+
+        data["y"] = torch.tensor(df.y.values, dtype=torch.float)
+        return data
 
     def __len__(self):
-        return len(self.y)
+        return self.n_observation
 
     def __getitem__(self, idx):
-        covar = [self.x_loc[idx], self.y_loc[idx], self.i[idx], self.d[idx]]
-        if self.condition == 1:
-            covar = covar[1:]
-        return covar, self.y[idx]
+        covar_data = []
+        for covar in self.covar:
+            covar_data.append(self.data[covar][idx])
+        return covar_data, self.data['y'][idx]
 
 
 class Model(torch.nn.Module):
-    def __init__(self, n_covar):
+    def __init__(self, n_covar, lbd_scale, k_scale):
         super().__init__()
         self.n_covar = n_covar
 
@@ -50,6 +55,17 @@ class Model(torch.nn.Module):
         self.mu = torch.nn.Parameter(torch.zeros(n_covar + 1))
 
         self.alpha_param = torch.nn.Parameter(torch.zeros(2))
+
+        self.lbd_scale = lbd_scale
+        self.k_scale = k_scale
+
+    def sample_concentration_parameter(self, n_sample):
+
+        alpha_mu, alpha_logvar = self.alpha_param
+        alpha_sd = (0.5 * alpha_logvar).exp()
+        alpha_smp = torch.randn(size=(n_sample, 1)) * alpha_sd + alpha_mu
+        k_smp = 1e-7 + torch.sigmoid(alpha_smp) * self.k_scale
+        return k_smp
 
     def beta_dist_parameters(self):
 
@@ -63,8 +79,7 @@ class Model(torch.nn.Module):
 
         return param
 
-    def forward(self, covar, y, n_sample,
-                lbd_scale, k_scale):  # !!! Be aware of this arbitrary choice
+    def forward(self, covar, y, n_sample):  # !!! Be aware of this arbitrary choice
 
         alpha_mu, alpha_logvar = self.alpha_param
         alpha_sd = (0.5 * alpha_logvar).exp()
@@ -89,11 +104,11 @@ class Model(torch.nn.Module):
 
             penalty += torch.distributions.Normal(mu, sd).log_prob(beta_smp)
 
-        unc_lbd = -sum_beta  # sigma in Stan, lambda/scale in Wikipdedia, scale in Torch
+        # unc_lbd = -sum_beta  # sigma in Stan, lambda/scale in Wikipedia, scale in Torch
         # !!! Not divided by k, contrary to the article
 
-        k_smp = 1e-7 + torch.sigmoid(unc_k) * k_scale        # alpha in Stan, k/shape in Wikipedia, k/contentration in Torch
-        lbd_smp = 1e-7 + torch.sigmoid(unc_lbd) * lbd_scale  # sigma in Stan, lambda/scale in Wikipdedia, scale in Torch
+        k_smp = 1e-7 + torch.sigmoid(unc_k) * self.k_scale                  # alpha in Stan, k/shape in Wikipedia, k/contentration in Torch
+        lbd_smp = 1e-7 + torch.sigmoid(-sum_beta / k_smp) * self.lbd_scale  # sigma in Stan, lambda/scale in Wikipdedia, scale in Torch
 
         lls = torch.distributions.Weibull(k_smp, lbd_smp).log_prob(y).sum(axis=-1)
         lls_mean = lls.mean()
@@ -108,10 +123,9 @@ def run(condition):
     lbd_scale = 2
     k_scale = 2
     learning_rate = 0.05
+    seed = 12345
+    fig_folder = f"fig/main-all/condition{condition}"
 
-    seed = 1234
-
-    fig_folder = "fig/main-all"
     os.makedirs(fig_folder, exist_ok=True)
 
     torch.manual_seed(seed)
@@ -121,7 +135,9 @@ def run(condition):
     n_obs = len(data)
     print("n observation", n_obs)
 
-    model = Model(data.n_covar)
+    model = Model(data.n_covar,
+                  lbd_scale=lbd_scale,
+                  k_scale=k_scale)
 
     dataloader = torch.utils.data.DataLoader(data, batch_size=len(data))
 
@@ -131,8 +147,7 @@ def run(condition):
 
     for _ in tqdm(range(n_epochs)):
         for batch, (covar, y) in enumerate(dataloader):
-            loss = model(covar=covar, y=y, n_sample=n_sample,
-                         lbd_scale=lbd_scale, k_scale=k_scale)
+            loss = model(covar=covar, y=y, n_sample=n_sample)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -145,25 +160,23 @@ def run(condition):
     plt.savefig(f"{fig_folder}/loss.pdf")
     plt.show()
 
-    # with torch.no_grad():
-    #     smp = model.draw_samples(n_sample=10000, x_loc=data.x_loc, y_loc=data.y_loc)
-    #
-    # for key, v in smp.items():
-    #     if key == "lbd":
-    #         v = v.mean(axis=-1)
-    #     elif key.startswith("beta"):
-    #         continue
-    #
-    #     m = v.mean()
-    #     print(f"{key}={m:.3f}")
-    #
-    #     fig, ax = plt.subplots()
-    #     sns.histplot(v.detach().numpy(), ax=ax, stat='density', legend=False)
-    #     ax.set_title(key)
-    #     plt.savefig(f"{fig_folder}/{key}_samples.pdf")
-    #     plt.show()
-
     with torch.no_grad():
+        smp = model.sample_concentration_parameter(n_sample=10000).detach().numpy()
+
+        mu, sd = np.mean(smp), np.std(smp)
+
+        lower, upper = mu - 1.96 * sd, mu + 1.96 * sd
+
+        print(f"k={mu:.3f} [{lower:.3f}, {upper:.3f}]")
+
+        fig, ax = plt.subplots()
+        sns.histplot(smp, ax=ax, stat='density', legend=False)
+        ax.set_title("k")
+        plt.savefig(f"{fig_folder}/k_samples.pdf")
+        plt.show()
+
+        # ------------------------------------------
+
         beta_dist_prm = model.beta_dist_parameters()
 
         for i in range(data.n_covar+1):
@@ -179,8 +192,11 @@ def run(condition):
 
             lower, upper = mu-1.96*sd, mu+1.96*sd
 
-            print(f"{key}={mu:.3f} [{lower:.3f}, {upper:.3f}]")
-
+            if (lower < 0 and upper < 0) or (upper > 0 and lower > 0):
+                sign = "*"
+            else:
+                sign = ""
+            print(f"{key}={mu:.3f} [{lower:.3f}, {upper:.3f}]{sign}")
             x = torch.linspace(mu-3*sd, mu+3*sd, 100)
             y = torch.distributions.Normal(mu, sd).log_prob(x).exp()
             x = x.numpy()
@@ -194,6 +210,68 @@ def run(condition):
                           color="red", ls="--")
             plt.savefig(f"{fig_folder}/{key}_dist.pdf")
             plt.show()
+
+        # ----------------------------------- #
+
+        c = {(0,0): "#B1DFEA", (0,1): '#55247B', (1,0): "yellow", (1,1): "#E60082"}
+        n_sample = 100
+
+        fig, ax = plt.subplots()
+
+        covar_set = (0, 0), (0, 1), (1, 0), (1, 1)
+
+        for covar in covar_set:
+
+            x = torch.linspace(0.1, 10, 200)
+
+            alpha_mu, alpha_logvar = model.alpha_param
+            alpha_sd = (0.5 * alpha_logvar).exp()
+            alpha_smp = torch.randn(size=(n_sample, 1)) * alpha_sd + alpha_mu
+            unc_k = alpha_smp
+
+            random_n = torch.randn(size=(model.n_covar + 1, n_sample, 1))
+
+            sum_beta = torch.zeros((n_sample, 1))
+            for i in range(model.n_covar + 1):
+                logvar = model.logvar[i]
+                mu = model.mu[i]
+                rd = random_n[i]
+                sd = (0.5 * logvar).exp()
+                beta_smp = rd * sd + mu
+                if i == model.n_covar:
+                    sum_beta += beta_smp
+                else:
+                    sum_beta += beta_smp * covar[i]
+
+            # unc_lbd = -sum_beta  # sigma in Stan, lambda/scale in Wikipedia, scale in Torch
+            # !!! Not divided by k, contrary to the article
+
+            k_smp = 1e-7 + torch.sigmoid(unc_k) * model.k_scale  # alpha in Stan, k/shape in Wikipedia, k/contentration in Torch
+            lbd_smp = 1e-7 + torch.sigmoid(
+                -sum_beta / k_smp) * model.lbd_scale  # sigma in Stan, lambda/scale in Wikipdedia, scale in Torch
+
+            print("k shape", k_smp.shape)
+            print("x shape", x.shape)
+            # x = x #.unsqueeze(-1)
+            print("x shape", x.shape)
+            print("lbd shape", lbd_smp.shape)
+            y = torch.distributions.Weibull(k_smp, lbd_smp).log_prob(x).exp()
+
+            print(y.shape)
+            x = x.squeeze().numpy()
+            y = y.squeeze().numpy()
+
+            print(x.shape)
+            print(y.shape)
+            for y_ in y:
+                sns.lineplot(x=x, y=y_, ax=ax, linestyle='-',
+                             color=c[covar], zorder=10,
+                             linewidth=0.3, alpha=0.1)
+
+
+        plt.savefig(f"{fig_folder}/survival.pdf")
+        plt.show()
+
 
 
 def main():
